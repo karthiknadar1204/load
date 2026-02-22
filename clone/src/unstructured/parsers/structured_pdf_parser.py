@@ -3,7 +3,7 @@ import os
 import re
 import sys
 import logging
-from typing import List, Dict, Any, Union, Optional
+from typing import List, Dict, Any, Union, Optional, Tuple
 from contextlib import ExitStack
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
@@ -24,6 +24,8 @@ from doctra.exporters.markdown_writer import write_markdown
 from doctra.exporters.html_writer import write_html, write_structured_html, render_html_table, write_html_from_lines
 from doctra.utils.progress import create_beautiful_progress_bar, create_multi_progress_bars, create_notebook_friendly_bar
 from doctra.parsers.split_table_detector import SplitTableDetector, SplitTableMatch
+
+from ..models import ParseResult
 
 
 class StructuredPDFParser:
@@ -131,12 +133,15 @@ class StructuredPDFParser:
         logging.getLogger('pytesseract').setLevel(logging.WARNING)
         logging.getLogger('markdown_it').setLevel(logging.WARNING)
 
-    def parse(self, pdf_path: str) -> None:
+    def parse(self, pdf_path: str) -> ParseResult:
         """
         Parse a PDF document and extract all content types.
 
+        Writes the same files to disk as before (outputs/{pdf_filename}/full_parse)
+        and returns an in-memory ParseResult for use with export(result, format).
+
         :param pdf_path: Path to the input PDF file
-        :return: None
+        :return: ParseResult with md_lines, html_lines, structured_items, and images
         """
         pdf_filename = os.path.splitext(os.path.basename(pdf_path))[0]
         out_dir = f"outputs/{pdf_filename}/full_parse"
@@ -170,6 +175,7 @@ class StructuredPDFParser:
         md_lines: List[str] = ["# Extracted Content\n"]
         html_lines: List[str] = ["<h1>Extracted Content</h1>"]
         structured_items: List[Dict[str, Any]] = []
+        image_paths_list: List[Tuple[str, str]] = []  # (rel_path, abs_path) for portable result
 
         charts_desc = "Charts (VLM → table)" if self.vlm is not None else "Charts (cropped)"
         tables_desc = "Tables (VLM → table)" if self.vlm is not None else "Tables (cropped)"
@@ -204,6 +210,7 @@ class StructuredPDFParser:
                         img_path = save_box_image(page_img, box, out_dir, page_num, i, IMAGE_SUBDIRS)
                         abs_img_path = os.path.abspath(img_path)
                         rel = os.path.relpath(abs_img_path, out_dir)
+                        image_paths_list.append((rel, abs_img_path))
 
                         if box.label == "figure":
                             figure_md = f"![Figure — page {page_num}]({rel})\n"
@@ -304,10 +311,11 @@ class StructuredPDFParser:
                         
                         abs_merged_path = os.path.abspath(merged_path)
                         rel_merged = os.path.relpath(abs_merged_path, out_dir)
-                        
+                        image_paths_list.append((rel_merged, abs_merged_path))
+
                         pages_str = f"pages {match.segment1.page_index}-{match.segment2.page_index}"
                         
-                        if self.use_vlm and self.vlm:
+                        if self.vlm is not None and self.vlm:
                             wrote_table = False
                             try:
                                 table = self.vlm.extract_table(abs_merged_path)
@@ -373,8 +381,26 @@ class StructuredPDFParser:
             html_structured_path = os.path.join(out_dir, "tables.html")
             write_structured_html(html_structured_path, structured_items)
 
+        # Build portable in-memory result (for export(result, format) without disk)
+        images: Dict[str, Tuple[bytes, str]] = {}
+        for rel_path, abs_path in image_paths_list:
+            try:
+                ext = os.path.splitext(abs_path)[1].lower()
+                mime = "image/png" if ext == ".png" else "image/jpeg"
+                with open(abs_path, "rb") as f:
+                    images[rel_path] = (f.read(), mime)
+            except Exception:
+                pass
+
         print(f"✅ Parsing completed successfully!")
         print(f"📁 Output directory: {out_dir}")
+
+        return ParseResult(
+            md_lines=md_lines,
+            html_lines=html_lines,
+            structured_items=structured_items,
+            images=images,
+        )
 
     def display_pages_with_boxes(self, pdf_path: str, num_pages: int = 3, cols: int = 2,
                                  page_width: int = 800, spacing: int = 40, save_path: str = None) -> None:

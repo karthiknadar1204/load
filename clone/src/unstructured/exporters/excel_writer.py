@@ -1,4 +1,5 @@
 from __future__ import annotations
+import io
 import os
 import re
 from typing import Dict, Any, List, Set
@@ -253,3 +254,74 @@ def write_structured_excel(excel_path: str, items: List[Dict[str, Any]]) -> str 
             _style_summary_sheet(summary_ws, summary_df, sheet_mapping)
 
     return excel_path
+
+
+def write_structured_excel_to_buffer(items: List[Dict[str, Any]]) -> bytes:
+    """
+    Write structured data items to an in-memory Excel workbook and return bytes.
+    Same content as write_structured_excel but no filesystem; for export(result, "excel").
+    """
+    if not items:
+        return b""
+
+    valid_items = []
+    for item in items:
+        headers = item.get("headers") or []
+        rows = item.get("rows") or []
+        if headers or (rows and any(
+                row for row in rows if any(cell for cell in row if cell is not None and str(cell).strip()))):
+            valid_items.append(item)
+
+    if not valid_items:
+        return b""
+
+    buffer = io.BytesIO()
+    taken: Set[str] = set()
+
+    with pd.ExcelWriter(buffer, engine="openpyxl", mode="w") as writer:
+        summary_data = []
+        sheet_mapping = {}
+
+        for item in valid_items:
+            title = item.get("title") or "Untitled"
+            description = item.get("description") or "No description available"
+            page_number = item.get("page", "Unknown")
+            item_type = item.get("type", "Table")
+            summary_data.append({
+                "Table Title": title,
+                "Description": description,
+                "Page": page_number,
+                "Type": item_type,
+            })
+
+        if summary_data:
+            summary_df = pd.DataFrame(summary_data)
+            summary_df.to_excel(writer, sheet_name="Table Summary", index=False)
+            taken.add("Table Summary")
+
+        for item in valid_items:
+            try:
+                title = item.get("title") or "Untitled"
+                headers = item.get("headers") or []
+                rows = item.get("rows") or []
+                sheet_name = _safe_sheet_name(title, taken)
+                sheet_mapping[title] = sheet_name
+                normalized_headers, normalized_rows = _normalize_data(headers, rows)
+                if not normalized_rows and not normalized_headers:
+                    continue
+                try:
+                    df = pd.DataFrame(normalized_rows, columns=normalized_headers)
+                except Exception:
+                    df = pd.DataFrame([["Error processing data"]], columns=["Message"])
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+                ws = writer.sheets[sheet_name]
+                _style_header(ws, ncols=df.shape[1])
+                _autosize_columns(ws, df)
+            except Exception:
+                continue
+
+        if summary_data and sheet_mapping:
+            summary_ws = writer.sheets["Table Summary"]
+            _style_summary_sheet(summary_ws, summary_df, sheet_mapping)
+
+    return buffer.getvalue()
